@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Application to receive data from webhook
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W3002
+
+Parameters:
+  EnvironmentAbbr:
+    Description: Abbreviation of the AWS account environment
+    Type: String
+  CustomDomainName:
+    Type: String
+    Description: The Domain name for the API
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: The ID of the hosted zone to which the resource record should be added
+  CertificateARN:
+    Type: String
+    Description: ARN for certificate
+
+Resources:
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/kinesisfirehose/firehose-log-group"
+      RetentionInDays: 30
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: "firehose-log-stream"
+
+  ####################################################
+  #create s3 bucket for data
+  ####################################################
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "lpd-data-cmdb-${EnvironmentAbbr}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToIAStorage
+            Prefix: ''
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 180
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        IgnorePublicAcls: True
+        BlockPublicPolicy: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  ########################################################
+  #create kinesis firehose to receieve data from gateway
+  ########################################################
+  KinesisFirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: amazon-apigateway-webhook-data-stream
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt S3Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 600
+          SizeInMBs: 128
+        CompressionFormat: UNCOMPRESSED
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        ErrorOutputPrefix: error/
+        Prefix: event/
+        RoleARN: !GetAtt ApiFirehoseIamRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseProcessLambdaFunction.Arn
+      Tags:
+        -
+          Key: Stack
+          Value:
+
+  #role for kinesis to s3
+  ApiFirehoseIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lpd-data-events-stream-reader-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'firehose.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Path: '/'
+      Policies:
+        - PolicyName: lpd-data-events-stream-reader-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3Bucket}"
+                  - !Sub "arn:aws:s3:::${S3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/webhook-log:*'
+        - PolicyName: lpd-data-stream-invoke-lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:Invoke*'
+                  - 'lambda:GetFunction*'
+                Resource:
+                  - !GetAtt FirehoseProcessLambdaFunction.Arn
+
+  ########################################################################
+  # create gateway to receieve http post request
+  ########################################################################
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      ApiKeySourceType: HEADER
+      Description: An API Gateway with a Firehose Integration
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: webhook-rest-api
+      MinimumCompressionSize: 0
+      Tags:
+        -
+          Key: Stack
+          Value:
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        ConnectionType: INTERNET
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+        IntegrationHttpMethod: POST
+        TimeoutInMillis: 29000
+        Type: AWS
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:firehose:action/PutRecord'
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: !Sub >
+            #set($payload = "$input.json('$')
+            ")
+            {
+              "DeliveryStreamName": "${KinesisFirehoseStream}",
+              "Record": {
+                "Data": "$util.base64Encode($payload)"
+              }
+            }
+        RequestParameters: #Firehose requires the content type to not be json, but amz-json
+          integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+
+        IntegrationResponses:
+          - StatusCode: 200 #create a default response for the caller
+            ResponseTemplates:
+              application/json: '{"status":"OK"}'
+      MethodResponses:
+        - StatusCode: 200
+      OperationName: 'receive_webhook_post'
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref WebhookApi
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: ''
+      RestApiId: !Ref WebhookApi
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lpd-gateway-firehose-access-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'apigateway.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: lpd-gateway-firehose-access-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:Put*'
+                  - 'firehose:List*'
+                  - 'firehose:Describe*'
+                Resource: !GetAtt KinesisFirehoseStream.Arn
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: 'v1'
+      RestApiId: !Ref WebhookApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: "The key will be used in the header for post request"
+      Enabled: false
+      Name: webhook-gateway-apikey
+      StageKeys:
+        - RestApiId: !Ref WebhookApi
+          StageName: !Ref ApiStage
+
+  UsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    DependsOn: ApiStage
+    Properties:
+      ApiStages:
+        - ApiId: !Ref WebhookApi
+          Stage: 'v1'
+      Description: Customer webhook usage plan
+      Quota:
+        Limit: 500000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+      UsagePlanName: webhook-gateway-usage-plan
+
+  UsagePlanApiKeyIntegration:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethod
+    Properties:
+      Description: Lambda API Deployment
+      RestApiId: !Ref WebhookApi
+
+  ###################################################
+  #create custom domain for gateway api
+  ###################################################
+  DomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      RegionalCertificateArn: !Ref CertificateARN
+      DomainName: !Ref CustomDomainName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      SecurityPolicy: TLS_1_2
+
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId:
+          !GetAtt DomainName.RegionalHostedZoneId
+        DNSName:
+          !GetAtt DomainName.RegionalDomainName
+
+  BasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn: DomainName
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RestApiId: !Ref WebhookApi
+      Stage: !Ref ApiStage
+
+  ############################################################
+  #create lambda function for processing firehose data format
+  ############################################################
+  FirehoseProcessLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: ../functions//
+      Description: AWS Lambda function FirehoseProcessLambdaFunction
+      Environment:
+        Variables:
+          environment_abbr: !Ref EnvironmentAbbr
+      FunctionName: 'firehose-preprocess-newline-lambda'
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIamRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+
+  FirehoseProcessLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt FirehoseProcessLambdaFunction.Arn
+      Principal: firehose.amazonaws.com
+      SourceArn: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/amazon-apigateway-webhook-data-stream"
+
+  LambdaIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: lambda-firehose-access-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - firehose:*
+                Resource: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/amazon-apigateway-webhook-data-stream"
+        - PolicyName: cloud-watch-access-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: 'Allow'
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/firehose-preprocess-newline-lambda:*"
+
+#############################
+  ApiGwAccountConfig:
+    Type: "AWS::ApiGateway::Account"
+    Properties:
+      CloudWatchRoleArn: !GetAtt "ApiGatewayLoggingRole.Arn"
+
+  ApiGatewayLoggingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
